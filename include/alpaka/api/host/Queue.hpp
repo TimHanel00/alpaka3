@@ -321,6 +321,7 @@ namespace alpaka::onHost
                  */
                 if(queue.isQueueEmpty() == false)
                 {
+                    // Queue synchronization does not propagate preceding callback failures.
                     queue.submit([]() {}).wait();
                 }
             }
@@ -332,6 +333,10 @@ namespace alpaka::onHost
             void operator()(cpu::Queue<T_Device>& queue, T_Event& event) const
             {
                 ALPAKA_LOG_FUNCTION(onHost::logger::event + onHost::logger::queue);
+                // Acquire the queue lock before the event lock, so pending event work can finish.
+                std::unique_lock<std::recursive_mutex> queueLock(queue.m_mutex, std::defer_lock);
+                if(queue.m_isBlocking)
+                    queueLock.lock();
                 // open a scope to avoid logging during we hold the lock for this class
                 {
                     // Setting the event state (e.g. the future) and enqueuing it has to be atomic.
@@ -347,10 +352,6 @@ namespace alpaka::onHost
                      */
                     if(queue.m_isBlocking)
                     {
-                        /* a blocking queue must acquire this lock to ensure that all pending host tasks
-                         * have finished
-                         */
-                        std::lock_guard<std::recursive_mutex> queueLock(queue.m_mutex);
                         // Nothing to do if it has been re-enqueued to a later position in the queue.
                         if(enqueueCount == event.m_enqueueCount)
                         {
@@ -393,38 +394,16 @@ namespace alpaka::onHost
             void operator()(cpu::Queue<T_Device>& queue, cpu::Event<T_Device>& event) const
             {
                 ALPAKA_LOG_FUNCTION(onHost::logger::event + onHost::logger::queue);
-                // open a scope to avoid logging during we hold the lock for this class
+                auto sharedEvent = event.getSharedPtr();
+                std::shared_future<void> oldFuture;
                 {
-                    // Setting the event state and enqueuing it has to be atomic.
-                    std::unique_lock<std::mutex> eventLock(event.m_mutex);
-
+                    std::lock_guard<std::mutex> eventLock(event.m_mutex);
                     if(!event.isReady())
-                    {
-                        /* In case the queue is blocking we can not use queue.submit() because we hold the lock
-                         * already. The blocking queue executes the lambda directly which will create a deadlock.
-                         */
-                        if(queue.m_isBlocking)
-                        {
-                            /* a blocking queue must acquire this lock to ensure that all pending host tasks
-                             * have finished
-                             */
-                            std::lock_guard<std::recursive_mutex> queueLock(queue.m_mutex);
-                            std::shared_future sFuture = event.m_future;
-                            eventLock.unlock();
-                            sFuture.get();
-                        }
-                        else
-                        {
-                            auto sharedEvent = event.getSharedPtr();
-                            auto oldFuture = event.m_future;
-
-                            // unlock here to avoid keeping the look during the maybe expensive enqueue of the task
-                            eventLock.unlock();
-                            // Enqueue a task that waits for the given future of the event.
-                            queue.submit([sharedEvent, oldFuture]() { oldFuture.get(); });
-                        }
-                    }
+                        oldFuture = event.m_future;
                 }
+                // Keep this recording even if the event is re-enqueued while the queue waits.
+                if(oldFuture.valid())
+                    queue.submit([sharedEvent, oldFuture]() { oldFuture.get(); });
             }
         };
 
