@@ -181,6 +181,7 @@ namespace alpaka::core
                                 state->tasks.pop();
                             }
                             // Task will be destroyed here, the queue status is already updated.
+                            // Known limitation: an empty queue does not include destruction of task captures.
                         }
                         // In case the executed tasks is the last task in the queue the waiting threads will see the
                         // queue as empty.

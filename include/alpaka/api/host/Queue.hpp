@@ -321,6 +321,7 @@ namespace alpaka::onHost
                  */
                 if(queue.isQueueEmpty() == false)
                 {
+                    // Queue synchronization does not propagate preceding callback failures.
                     queue.submit([]() {}).wait();
                 }
             }
@@ -332,6 +333,15 @@ namespace alpaka::onHost
             void operator()(cpu::Queue<T_Device>& queue, T_Event& event) const
             {
                 ALPAKA_LOG_FUNCTION(onHost::logger::event + onHost::logger::queue);
+                /* a blocking queue must acquire this lock to ensure that all pending host tasks
+                 * have finished
+                 *
+                 * Acquire the queue lock before the event lock. A pending queue dependency may need the event
+                 * lock to complete, so holding it while waiting for the queue lock would create a deadlock.
+                 */
+                std::unique_lock<std::recursive_mutex> queueLock(queue.m_mutex, std::defer_lock);
+                if(queue.m_isBlocking)
+                    queueLock.lock();
                 // open a scope to avoid logging during we hold the lock for this class
                 {
                     // Setting the event state (e.g. the future) and enqueuing it has to be atomic.
@@ -347,10 +357,6 @@ namespace alpaka::onHost
                      */
                     if(queue.m_isBlocking)
                     {
-                        /* a blocking queue must acquire this lock to ensure that all pending host tasks
-                         * have finished
-                         */
-                        std::lock_guard<std::recursive_mutex> queueLock(queue.m_mutex);
                         // Nothing to do if it has been re-enqueued to a later position in the queue.
                         if(enqueueCount == event.m_enqueueCount)
                         {
@@ -393,37 +399,49 @@ namespace alpaka::onHost
             void operator()(cpu::Queue<T_Device>& queue, cpu::Event<T_Device>& event) const
             {
                 ALPAKA_LOG_FUNCTION(onHost::logger::event + onHost::logger::queue);
+                // Keep the event alive until the dependency wait has finished.
+                auto sharedEvent = event.getSharedPtr();
+                std::shared_future<void> oldFuture;
                 // open a scope to avoid logging during we hold the lock for this class
                 {
-                    // Setting the event state and enqueuing it has to be atomic.
-                    std::unique_lock<std::mutex> eventLock(event.m_mutex);
-
+                    // Checking the event state and copying its current future has to be atomic with re-enqueueing.
+                    std::lock_guard<std::mutex> eventLock(event.m_mutex);
                     if(!event.isReady())
+                        oldFuture = event.m_future;
+                }
+                /* Release the event lock before acquiring the queue lock or enqueuing the wait. The producer
+                 * needs the event lock to finish its recording and make the copied future ready.
+                 * Keep this recording even if the event is re-enqueued while the queue waits.
+                 */
+                if(oldFuture.valid())
+                {
+                    if(queue.m_isBlocking)
                     {
-                        /* In case the queue is blocking we can not use queue.submit() because we hold the lock
-                         * already. The blocking queue executes the lambda directly which will create a deadlock.
+                        /* a blocking queue must acquire this lock to ensure that all pending host tasks
+                         * have finished
                          */
-                        if(queue.m_isBlocking)
-                        {
-                            /* a blocking queue must acquire this lock to ensure that all pending host tasks
-                             * have finished
-                             */
-                            std::lock_guard<std::recursive_mutex> queueLock(queue.m_mutex);
-                            std::shared_future sFuture = event.m_future;
-                            eventLock.unlock();
-                            sFuture.get();
-                        }
-                        else
-                        {
-                            auto sharedEvent = event.getSharedPtr();
-                            auto oldFuture = event.m_future;
+                        std::lock_guard<std::recursive_mutex> queueLock(queue.m_mutex);
+                        ++queue.m_blockingTaskExecutionDepth;
 
-                            // unlock here to avoid keeping the look during the maybe expensive enqueue of the task
-                            eventLock.unlock();
-                            // Enqueue a task that waits for the given future of the event.
-                            queue.submit([sharedEvent, oldFuture]() { oldFuture.get(); });
-                        }
+                        /* An event dependency counts as unfinished work until the direct wait returns.
+                         * Restore the depth also if future.get() throws, so queue synchronization remains usable.
+                         */
+                        struct DepthGuard
+                        {
+                            std::atomic<uint32_t>& depth;
+
+                            ~DepthGuard()
+                            {
+                                --depth;
+                            }
+                        } depthGuard{queue.m_blockingTaskExecutionDepth};
+
+                        // Execute directly in the caller thread; no submitted task or ready future is needed.
+                        oldFuture.get();
                     }
+                    else
+                        // Enqueue a task that waits for the given future of the event.
+                        queue.submit([sharedEvent, oldFuture]() { oldFuture.get(); });
                 }
             }
         };

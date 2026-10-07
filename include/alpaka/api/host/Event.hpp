@@ -152,6 +152,7 @@ namespace alpaka::onHost
             {
                 ALPAKA_LOG_FUNCTION(onHost::logger::event);
                 std::unique_lock<std::mutex> lk(m_mutex);
+                // Known limitation: this wait does not report preceding callback failures.
                 size_t enqueueCount = m_enqueueCount;
 
                 while(enqueueCount > m_lastReadyEnqueueCount)
